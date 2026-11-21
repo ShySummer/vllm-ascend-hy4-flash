@@ -1,14 +1,16 @@
 """Ascend prefetch-based CPU offloading with NZ-format static buffers."""
 
 from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch_npu
 from vllm.logger import logger
+from vllm.model_executor.offloader.base import should_pin_memory
 from vllm.model_executor.offloader.prefetch import (
     ParamInfo as VllmParamInfo,
 )
@@ -19,11 +21,68 @@ from vllm.model_executor.offloader.prefetch import (
 from vllm.model_executor.offloader.prefetch import (
     _ModuleOffloader as VllmModuleOffloader,
 )
+from vllm.utils.torch_utils import is_non_overlapping_and_dense
 
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 # mark
 _ASCEND_PREFETCH_NZ_WEIGHT_ATTR = "_vllm_ascend_prefetch_offload_nz_weight"
+_ASCEND_PREFETCH_PARAMETER_ATTR = "_vllm_ascend_prefetch_offloaded"
+
+
+@contextmanager
+def _prefetch_device_loading_context(module: nn.Module, target_device: torch.device, *, fallback):
+    cpu_parameters = {
+        name: parameter for name, parameter in module.named_parameters() if parameter.device.type == "cpu"
+    }
+    if (
+        target_device.type != "npu"
+        or not cpu_parameters
+        or not all(getattr(parameter, _ASCEND_PREFETCH_PARAMETER_ATTR, False) for parameter in cpu_parameters.values())
+        or any(getattr(parameter, "_vllm_is_uva_offloaded", False) for parameter in cpu_parameters.values())
+    ):
+        with fallback(module, target_device):
+            yield module
+        return
+
+    # Quantization can transpose these weights without changing their storage
+    # size. Retain the existing pinned allocations instead of creating a second
+    # host copy of every offloaded expert during weight finalization.
+    host_storage = {name: parameter.data for name, parameter in cpu_parameters.items()}
+    for parameter in cpu_parameters.values():
+        parameter.data = parameter.data.to(target_device)
+    try:
+        yield module
+    finally:
+        for name, parameter in module.named_parameters():
+            original = host_storage.get(name)
+            if original is None:
+                continue
+            source = parameter.data
+            can_reuse = (
+                source.dtype == original.dtype
+                and source.numel() == original.numel()
+                and is_non_overlapping_and_dense(source)
+                and is_non_overlapping_and_dense(original)
+                and not _is_using_nz_weight(parameter)
+            )
+            if can_reuse:
+                restored = original.as_strided(source.shape, source.stride())
+                restored.as_strided((source.numel(),), (1,)).copy_(source.as_strided((source.numel(),), (1,)))
+            else:
+                # Repacked/padded/NZ schemes retain upstream's copy semantics.
+                restored = torch.empty_like(source, device="cpu", pin_memory=should_pin_memory()).copy_(source)
+            parameter.data = restored
+
+
+def _install_prefetch_loading_context() -> None:
+    # Lazy import avoids the model-loader/offloader initialization cycle.
+    # Remove this hook once upstream supports reusing host loading storage.
+    from vllm.model_executor.model_loader import utils as loader_utils
+
+    current = loader_utils.device_loading_context
+    if not (isinstance(current, partial) and current.func is _prefetch_device_loading_context):
+        loader_utils.device_loading_context = partial(_prefetch_device_loading_context, fallback=current)
 
 
 def mark_prefetch_offload_nz_weight(param: nn.Parameter) -> None:
@@ -137,6 +196,21 @@ def _raise_if_nz_prefetch_incompatible_with_graph(param_infos: list[ParamInfo]) 
     )
 
 
+def _raise_if_pageable_prefetch_incompatible_with_graph() -> None:
+    """Reject pageable H2D before CANN obscures it with a capture-end error."""
+    from vllm.config import get_current_vllm_config
+
+    if should_pin_memory() or get_current_vllm_config().model_config.enforce_eager:
+        return
+    raise RuntimeError(
+        "Ascend prefetch weight offload with ACL graph capture requires pinned "
+        "CPU weights. Pageable H2D copies cannot be captured by CANN and cause "
+        "a secondary unjoined-stream/capture_end 107025 error. Unset "
+        "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY (or set it to 0) and ensure "
+        "sufficient host pinned memory, or use enforce_eager=True."
+    )
+
+
 class AscendPrefetchOffloader(PrefetchOffloader):
     """Ascend prefetch offloader that reuses vLLM behavior with NZ buffers."""
 
@@ -156,6 +230,7 @@ class AscendPrefetchOffloader(PrefetchOffloader):
             mode=mode,
         )
         self.module_offloaders: list[_ModuleOffloader] = []
+        _install_prefetch_loading_context()
 
     def wrap_modules(
         self,
@@ -171,6 +246,8 @@ class AscendPrefetchOffloader(PrefetchOffloader):
             vllm_prefetch._ModuleOffloader = original_module_offloader
 
     def post_init(self):
+        if self.module_offloaders:
+            _raise_if_pageable_prefetch_incompatible_with_graph()
         super().post_init()
 
         device: torch.device | None = None
@@ -209,6 +286,57 @@ class _ModuleOffloader(VllmModuleOffloader):
             layer_idx=layer_idx,
         )
         self._wrap_process_weights_for_format_detection()
+        for offloader in self._param_offloaders.values():
+            setattr(offloader._param, _ASCEND_PREFETCH_PARAMETER_ATTR, True)
+
+    def sync_cpu_storage(self):
+        # Ascend SFA disposes absorbed projections by replacing their storage
+        # with an empty tensor, while retaining the nn.Parameter. Empty host
+        # allocations cannot be pinned and must not enter the prefetch pool.
+        disposed = []
+        for name, offloader in self._param_offloaders.items():
+            try:
+                if offloader._param.numel() == 0:
+                    disposed.append(name)
+            except AttributeError:
+                # Upstream handles parameters deleted by quantizers.
+                continue
+        for name in disposed:
+            del self._param_offloaders[name]
+        super().sync_cpu_storage()
+
+    def _copy_param_to_static(self, cpu_storage: torch.Tensor, gpu_buffer: torch.Tensor) -> None:
+        # NPU copy_ of a transposed CPU tensor otherwise creates a pageable
+        # contiguous temporary. A raw-storage view preserves pinned DMA and
+        # graph capture when source and destination have the same dense layout.
+        if (
+            not cpu_storage.is_contiguous()
+            and cpu_storage.shape == gpu_buffer.shape
+            and cpu_storage.stride() == gpu_buffer.stride()
+            and is_non_overlapping_and_dense(cpu_storage)
+            and not _is_using_nz_weight(gpu_buffer)
+        ):
+            cpu_storage = cpu_storage.as_strided((cpu_storage.numel(),), (1,))
+            gpu_buffer = gpu_buffer.as_strided((gpu_buffer.numel(),), (1,))
+        gpu_buffer.copy_(cpu_storage, non_blocking=True)
+
+    def start_onload_to_static(self):
+        """Fork/join the copy stream and preserve pinned transposed weights."""
+        assert self._buffer_pool is not None, "Buffer pool not assigned"
+        self._prefetch_in_capture = torch.npu.is_current_stream_capturing()
+        fork_event = torch.npu.Event()
+        torch.npu.current_stream().record_event(fork_event)
+        self.copy_stream.wait_event(fork_event)
+        with torch.npu.stream(self.copy_stream):
+            for name, offloader in self._param_offloaders.items():
+                cpu_storage = offloader._cpu_storage
+                gpu_buffer = offloader._gpu_buffer
+                assert cpu_storage is not None, "CPU storage not initialized"
+                assert gpu_buffer is not None, "GPU buffer not assigned"
+                assert not should_pin_memory() or cpu_storage.is_pinned(), f"CPU storage for {name} is not pinned"
+                self._copy_param_to_static(cpu_storage, gpu_buffer)
+        self._copy_done_event.record(self.copy_stream)
+        self._event_valid_for_eager = not torch.npu.is_current_stream_capturing()
 
     def _capture_static_buffer_formats_from_npu_params(self) -> None:
         """
@@ -220,7 +348,12 @@ class _ModuleOffloader(VllmModuleOffloader):
         and set a mark to param if its weights is in NZ format.
         """
         for param_offloader in self._param_offloaders.values():
-            param = param_offloader._param
+            try:
+                param = param_offloader._param
+            except AttributeError:
+                # Quantizers may delete transient scale parameters. Upstream
+                # sync_cpu_storage prunes these after all quantizers finish.
+                continue
             if _is_using_nz_weight(param):
                 mark_prefetch_offload_nz_weight(param)
 
